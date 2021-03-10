@@ -1,4 +1,5 @@
 import { osType, isWindows } from 'https://deno.land/std@0.80.0/_util/os.ts';
+import { format as dateFormat } from 'https://deno.land/std@0.89.0/datetime/mod.ts';
 import { buildUrl } from 'https://deno.land/x/url_builder/mod.ts';
 import { sleep } from 'https://deno.land/x/sleep/mod.ts';
 import { exec } from 'https://deno.land/x/exec/mod.ts';
@@ -292,6 +293,13 @@ export default class MonkeyMaster {
             : `http://trade.jd.com/shopping/order/getOrderInfo.action?rid=${Date.now()}`;
         let res;
 
+        console.info(
+            `getOrderInfo req start at ${dateFormat(
+                new Date(),
+                'yyyy-MM-dd HH:mm:ss.SSS'
+            )}`
+        );
+
         if (this.isPreSale) {
             const headers = new Headers(this.headers);
             headers.set('content-type', 'application/x-www-form-urlencoded');
@@ -326,7 +334,7 @@ export default class MonkeyMaster {
         if (this.options.fp && this.options.eid) {
             this.fp = this.options.fp;
             this.eid = this.options.eid;
-        } else if (!isWindows) {
+        } else if (this.fpRequired) {
             logger.info('获取必要信息中，大约需要30秒');
 
             const browser = await initBrowser();
@@ -378,7 +386,12 @@ export default class MonkeyMaster {
             payload['submitOrderParam.payPassword'] = encodePwd(password);
         }
 
-        logger.info(`submit_order req start at ${Date()}`);
+        console.info(
+            `submit_order req start at ${dateFormat(
+                new Date(),
+                'yyyy-MM-dd HH:mm:ss.SSS'
+            )}`
+        );
 
         const headers = new Headers(this.headers);
         headers.set('Host', 'trade.jd.com');
@@ -416,27 +429,14 @@ export default class MonkeyMaster {
         const setTimeStamp = Date.parse(time);
         const runOrder = async () => {
             // 流式并行处理加快速度，但可能出错
-            this.addCart(this.skuids);
-            await sleep(0.06);
-            this.getOrderInfo();
-            await sleep(0.25);
-            this.submitOrder();
+            await Promise.race([this.addCart(this.skuids), sleep(0.06)]);
+            await Promise.race([this.getOrderInfo(), sleep(0.5)]);
+            await this.submitOrder();
         };
 
-        let jdTime = await this.timeSyncWithJD();
-        let timer = setTimeout(runOrder, setTimeStamp - jdTime);
-
         await this.cancelSelectCartSkus();
-
-        while (setTimeStamp > jdTime) {
-            logger.info(`距离抢购还剩 ${(setTimeStamp - jdTime) / 1000} 秒`);
-
-            // 30秒同步一次时间
-            await sleep(30);
-            clearTimeout(timer);
-            jdTime = await this.timeSyncWithJD();
-            timer = setTimeout(runOrder, setTimeStamp - jdTime);
-        }
+        await this.waiting4Start(setTimeStamp);
+        await runOrder();
     }
 
     async seckillOnTime(time, num = 1) {
@@ -452,7 +452,7 @@ export default class MonkeyMaster {
 
         const runOrder = async () => {
             // 抢5分钟
-            if (Date.now() - setTimeStamp > 1000 * 60 * 5) {
+            if (Date.now() - setTimeStamp > 1000 * 60 * 30) {
                 logger.critical('抢购时间已过，停止任务');
                 return Deno.exit();
             }
@@ -477,24 +477,13 @@ export default class MonkeyMaster {
                 logger.critical('不存在抢购');
             }
 
-            await sleep(0.2);
+            await sleep(random.real(2, 5));
             runOrder();
         };
 
-        let jdTime = await this.timeSyncWithJD();
-        let timer = setTimeout(runOrder, setTimeStamp - jdTime);
-
         await this.cancelSelectCartSkus();
-
-        while (setTimeStamp > jdTime) {
-            logger.info(`距离抢购还剩 ${(setTimeStamp - jdTime) / 1000} 秒`);
-
-            // 30秒同步一次时间
-            await sleep(30);
-            clearTimeout(timer);
-            jdTime = await this.timeSyncWithJD();
-            timer = setTimeout(runOrder, setTimeStamp - jdTime);
-        }
+        await this.waiting4Start(setTimeStamp);
+        await runOrder();
     }
 
     async fqkillOnTime(time, num = 1) {
@@ -526,20 +515,9 @@ export default class MonkeyMaster {
             runOrder();
         };
 
-        let jdTime = await this.timeSyncWithJD();
-        let timer = setTimeout(runOrder, setTimeStamp - jdTime);
-
         await this.cancelSelectCartSkus();
-
-        while (setTimeStamp > jdTime) {
-            logger.info(`距离抢购还剩 ${(setTimeStamp - jdTime) / 1000} 秒`);
-
-            // 30秒同步一次时间
-            await sleep(10);
-            clearTimeout(timer);
-            jdTime = await this.timeSyncWithJD();
-            timer = setTimeout(runOrder, setTimeStamp - jdTime);
-        }
+        await this.waiting4Start(setTimeStamp);
+        await runOrder();
     }
 
     async timeSyncWithJD() {
@@ -548,13 +526,56 @@ export default class MonkeyMaster {
         const syncEndTime = Date.now();
         const { serverTime } = await res.json();
 
-        const postConsume = (syncEndTime - syncStartTime) / 2;
+        // 一般 resp download 时间远小于 TTFB
+        const postConsume = (syncEndTime - syncStartTime) / 3;
 
         // 每次同步再次计算平均偏移时间
         this.postConsumes.push(postConsume);
+
+        console.info(`本次同步耗时 ${postConsume.toFixed(3)} ms`);
+
+        // 只取最后20个样本，多了干扰
+        if (this.postConsumes.length > 20) {
+            this.postConsumes.shift();
+        }
+
         this.avgTimeOffset = numAvg(this.postConsumes);
 
         return serverTime + postConsume + this.avgTimeOffset;
+    }
+
+    async waiting4Start(setTimeStamp) {
+        let jdTime = Date.now();
+
+        while (setTimeStamp > jdTime) {
+            jdTime = await this.timeSyncWithJD();
+            const timeRemainMS = setTimeStamp - jdTime;
+            const timeRemainSec = (timeRemainMS / 1000).toFixed(3);
+
+            console.info(
+                '\x1b[36m%s\x1b[0m',
+                `[当前时间${dateFormat(
+                    new Date(jdTime),
+                    'yyyy-MM-dd HH:mm:ss.SSS'
+                )}] 距离抢购还剩 ${timeRemainSec} 秒`
+            );
+
+            // 30秒同步一次时间
+            if (timeRemainSec > 5 * 60) {
+                await sleep(random.real(5, 60));
+            } else if (timeRemainSec > 10) {
+                await sleep(random.real(5, 9));
+            } else {
+                console.log(
+                    '\x1b[33m%s\x1b[0m',
+                    `--------------闭眼祈祷, 默数${Math.ceil(
+                        timeRemainSec
+                    )}下再看结果喔---------------`
+                );
+                await sleep(timeRemainSec);
+                break;
+            }
+        }
     }
 
     /**
@@ -651,7 +672,7 @@ export default class MonkeyMaster {
             if (item.items && item.items.length) {
                 return item.items.some(({ item }) => item.Id === skuid);
             } else {
-                console.log(item.Id, skuid)
+                console.log(item.Id, skuid);
                 return item.Id === skuid;
             }
         });
@@ -696,15 +717,15 @@ export default class MonkeyMaster {
             },
         });
 
-        const res = await mFetch(url, { timeout: 1000 });
-
         let stockInfo;
 
-        if (res.ok) {
-            try {
+        try {
+            const res = await mFetch(url, { timeout: 1000 });
+
+            if (res.ok) {
                 stockInfo = str2Json(await res.text());
-            } catch (error) {}
-        }
+            }
+        } catch {}
 
         return stockInfo;
     }
